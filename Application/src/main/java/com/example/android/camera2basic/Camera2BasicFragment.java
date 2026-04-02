@@ -204,6 +204,11 @@ public class Camera2BasicFragment extends Fragment
 
     private static Module model = null;
 
+    // NPU 推理辅助类（TFLite + NNAPI）
+    private static NpuModelHelper npuModelHelper = null;
+    // true = 使用 NPU (TFLite + NNAPI)；false = 使用 PyTorch CPU
+    private static boolean useNpu = true;
+
     /**
      * {@link CameraDevice.StateCallback} is called when {@link CameraDevice} changes its state.
      */
@@ -215,13 +220,31 @@ public class Camera2BasicFragment extends Fragment
             mCameraOpenCloseLock.release();
             mCameraDevice = cameraDevice;
             createCameraPreviewSession();
-            try {
-                if (model == null) {
-                    model = Module.load(assetFilePath(getContext(), "model_jit.ptl"));
+
+            // 初始化推理引擎
+            if (useNpu) {
+                // 优先使用 TFLite + NNAPI (NPU)
+                try {
+                    if (npuModelHelper == null) {
+                        npuModelHelper = new NpuModelHelper(getContext(), "model.tflite");
+                    }
+                    Log.d(TAG, "NPU model loaded: " + npuModelHelper.getAcceleratorName());
+                } catch (Exception e) {
+                    Log.w(TAG, "NPU model 加载失败，降级到 PyTorch CPU", e);
+                    useNpu = false;
                 }
-                Log.d(TAG, "PyTorch model loaded successfully.");
-            } catch (IOException e) {
-                Log.e("Model", "Failed to load PyTorch model", e);
+            }
+
+            if (!useNpu) {
+                // 降级到 PyTorch CPU
+                try {
+                    if (model == null) {
+                        model = Module.load(assetFilePath(getContext(), "model_jit.ptl"));
+                    }
+                    Log.d(TAG, "PyTorch model loaded successfully (CPU).");
+                } catch (IOException e) {
+                    Log.e("Model", "Failed to load PyTorch model", e);
+                }
             }
         }
 
@@ -1109,20 +1132,31 @@ public class Camera2BasicFragment extends Fragment
                         }
                     }
 
-                    // 4. 送入模型 Tensor（1x1xHxW）
-                    Tensor inputTensor = Tensor.fromBlob(floatPixels, new long[]{1, 1, height, width});
-                    Log.d("ModelInput", Arrays.toString(inputTensor.shape()));
-//                    Log.d("ModelInput", Arrays.toString(inputTensor.getDataAsFloatArray()));
+                    // 4. 送入模型推理
+                    float[] outArray;
                     long startTime = System.nanoTime();
-                    Tensor outputTensor = model.forward(IValue.from(inputTensor)).toTensor();
+
+                    if (useNpu && npuModelHelper != null) {
+                        // ===== NPU 推理路径 (TFLite + NNAPI) =====
+                        int outputSize = 3 * height * width;
+                        outArray = npuModelHelper.runInference(
+                                floatPixels, 1, 1, height, width, outputSize);
+                        Log.d("ModelInference", "Backend: " + npuModelHelper.getAcceleratorName());
+                    } else {
+                        // ===== PyTorch CPU 推理路径（兜底） =====
+                        Tensor inputTensor = Tensor.fromBlob(floatPixels, new long[]{1, 1, height, width});
+                        Log.d("ModelInput", Arrays.toString(inputTensor.shape()));
+                        Tensor outputTensor = model.forward(IValue.from(inputTensor)).toTensor();
+                        Log.d("ModelOutput", Arrays.toString(outputTensor.shape()));
+                        outArray = outputTensor.getDataAsFloatArray();
+                    }
+
                     long endTime = System.nanoTime();
                     long duration = endTime - startTime;
-                    Log.d("ModelOutput", Arrays.toString(outputTensor.shape()));
-//                    Log.d("ModelOutput", Arrays.toString(outputTensor.getDataAsFloatArray()));
-                    Log.d("ModelInference", "Inference time: " + duration/ 1_000_000.0 + " ms");
-                    showToast("Finished (Inference time: " + duration/ 1_000_000_000.0 + " s)");
-
-                    float[] outArray = outputTensor.getDataAsFloatArray();
+                    String backend = (useNpu && npuModelHelper != null)
+                            ? npuModelHelper.getAcceleratorName() : "CPU (PyTorch)";
+                    Log.d("ModelInference", "Inference time: " + duration / 1_000_000.0 + " ms");
+                    showToast(backend + " | " + String.format("%.2f", duration / 1_000_000_000.0) + " s");
                     //int width2 = targetW*1, height2 = targetH*1;
                     int[] pixels = new int[width * height];
                     for (int i = 0; i < width * height; i++) {
